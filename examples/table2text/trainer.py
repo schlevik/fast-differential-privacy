@@ -20,7 +20,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data.sampler import RandomSampler, SequentialSampler
 from tqdm.auto import tqdm, trange
 from transformers.data.data_collator import DataCollator, DataCollatorWithPadding, default_data_collator
-from transformers.file_utils import is_datasets_available, is_torch_tpu_available
+from transformers.file_utils import is_datasets_available
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.auto.modeling_auto import MODEL_FOR_QUESTION_ANSWERING_MAPPING
 from transformers.optimization import AdamW, get_linear_schedule_with_warmup
@@ -29,7 +29,7 @@ from transformers.trainer_pt_utils import distributed_broadcast_scalars
 from transformers.trainer_utils import (EvalPrediction, EvaluationStrategy, IntervalStrategy, PREFIX_CHECKPOINT_DIR,
                                         PredictionOutput, TrainOutput, set_seed)
 from transformers.utils import logging
-from transformers.deepspeed import deepspeed_init
+from transformers.integrations.deepspeed import deepspeed_init
 import deepspeed
 
 import decoding_utils
@@ -155,10 +155,10 @@ class Trainer:
         # Create output directory if needed
         if self.is_world_process_zero():
             os.makedirs(self.args.output_dir, exist_ok=True)
-        if is_torch_tpu_available():
-            # Set an xla_device flag on the model's config.
-            # We'll find a more elegant and not need to do this in the future.
-            self.model.config.xla_device = True
+        # if is_torch_tpu_available():
+        #     # Set an xla_device flag on the model's config.
+        #     # We'll find a more elegant and not need to do this in the future.
+        #     self.model.config.xla_device = True
         if not callable(self.data_collator) and callable(getattr(self.data_collator, "collate_batch", None)):
             self.data_collator = self.data_collator.collate_batch
             warnings.warn(
@@ -323,7 +323,6 @@ class Trainer:
                 Local path to the model if the model to train has been instantiated from a local path. If present,
                 training will resume from the optimizer/scheduler states loaded here.
         """
-
         # Model re-init
         if self.model_init is not None:
             # Seed must be set before instantiating the model when using model_init.
@@ -378,7 +377,6 @@ class Trainer:
         # Evaluate before training.
         if self.args.evaluate_before_training:
             self.evaluate(epoch=0)  # No need to report to hp search.
-
 
         # Train!
         total_train_batch_size = (
@@ -472,7 +470,7 @@ class Trainer:
 
                 if self.args.deepspeed_config:
                     model.step()
-
+                print("step", step, 'self.args.gradient_accumulation_steps', self.args.gradient_accumulation_steps)
                 # https://github.com/microsoft/DeepSpeed/issues/758
                 if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
                     # last step in epoch but step is always smaller than gradient_accumulation_steps
@@ -535,6 +533,8 @@ class Trainer:
                             torch.save(self.optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
                             torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
 
+                # print(">>>>>>>>>>>>>>>>>>>>>>>>>>>>", self.global_step)
+                # assert False    
                 epoch_pbar.update(1)
                 if self.args.max_steps > 0 and self.global_step >= self.args.max_steps:
                     break
@@ -557,6 +557,7 @@ class Trainer:
             delattr(self, "_past")
 
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
+        # print(self.global_step)
         return TrainOutput(self.global_step, tr_loss.item() / self.global_step, metrics=dict())
 
     def log(self, logs: Dict[str, float], iterator: Optional[tqdm] = None) -> None:
@@ -689,9 +690,8 @@ class Trainer:
         Will only save from the world_master process (unless in TPUs).
         """
 
-        if is_torch_tpu_available():
-            self._save_tpu(output_dir)
-        elif self.is_world_process_zero():
+
+        if self.is_world_process_zero():
             self._save(output_dir)
 
     def _save(self, output_dir: Optional[str] = None):

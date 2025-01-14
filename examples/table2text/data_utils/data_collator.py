@@ -101,7 +101,7 @@ class DataCollatorForData2TextLanguageModeling:
         if are_tensors_same_length:
             return torch.stack(examples, dim=0)
         else:
-            if self.tokenizer._pad_token is None:
+            if self.tokenizer.pad_token_id is None:
                 raise ValueError(
                     "You are attempting to pad samples but the tokenizer you are using"
                     f" ({self.tokenizer.__class__.__name__}) does not have one."

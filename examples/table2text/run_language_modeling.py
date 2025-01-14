@@ -21,9 +21,12 @@ using a masked language modeling (MLM) loss. XLNet is fine-tuned using a permuta
 
 import json
 import logging
+import math
 import os
 
+import datasets
 import torch
+import transformers
 from ml_swissknife import utils
 from transformers import HfArgumentParser, MODEL_WITH_LM_HEAD_MAPPING, set_seed
 from transformers.models.gpt2 import GPT2Tokenizer
@@ -102,7 +105,7 @@ def main():
 
         # Tokenizer; `bos_token` and `eos_token` is the same for GPT2; both are 50256.
         tokenizer = GPT2Tokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=model_args.cache_dir)
-
+        tokenizer.pad_token_id = tokenizer.eos_token_id
         # Model.
         gpt_model = GPT2LMHeadModel.from_pretrained(
             model_args.model_name_or_path,
@@ -130,76 +133,47 @@ def main():
         minGPT_config.n_embd = 768
         gpt_model = GPT(minGPT_config)
         config = gpt_model.config
-
-
-    # Clone the embedding into the lm_head for better initialization.
-    # if not 'min' in model_args.model_name_or_path:
-    lm_head = gpt_model.get_output_embeddings()
-    embedding = gpt_model.get_input_embeddings()
-    lm_head.weight.data.copy_(embedding.weight.data)
-    print(f'Cloning initial embedding into lm_head, '
-        f'checking norms... \n'
-        f'\tlm_head: {lm_head.weight.norm()}, embedding: {embedding.weight.norm()}')
-    torch.testing.assert_allclose(lm_head.weight, embedding.weight)
-    del lm_head, embedding
-
-    if data_args.block_size <= 0:
-        data_args.block_size = tokenizer.model_max_length
     else:
-        data_args.block_size = min(data_args.block_size, tokenizer.model_max_length)
+        gpt_model  = transformers.AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path)
+        config = gpt_model.config
+        tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path)
+        if not tokenizer.pad_token:
+            tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # Adjust tokenizer and model embeddings.
-    print('adapt tokenizer to include [PAD]')
-    print(f'before len(tokenizer) = {len(tokenizer)}')
-    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-    print(f'after len(tokenizer) = {len(tokenizer)}')
-    print('tokenizer.eos_token:', tokenizer.eos_token, tokenizer.eos_token_id)
-    print('tokenizer.bos_token:', tokenizer.bos_token, tokenizer.bos_token_id)
-
-    print('adapt the size of lm_head and input_embeddings to include [PAD]')
-    print('use avg-based initialization')
-
-    input_embeddings_before = gpt_model.get_input_embeddings().weight
-    lm_head_before = gpt_model.get_output_embeddings().weight
-    gpt_model.resize_token_embeddings(len(tokenizer))
-
-    input_embeddings_after = gpt_model.get_input_embeddings().weight
-    lm_head_after = gpt_model.get_output_embeddings().weight
-    print(
-        f'before lm_head.weight.size() = {lm_head_before.size()}, '
-        f'input_embeddings_before.size() = {input_embeddings_before.size()}'
-    )
-    print(
-        f'after lm_head.weight.size() = {lm_head_after.size()}, '
-        f'after input_embeddings_after.size() = {input_embeddings_after.size()}'
-    )
-    torch.testing.assert_allclose(lm_head_before, lm_head_after[:-1])
-    print('pre-chunk equal for lm_head')
-    torch.testing.assert_allclose(input_embeddings_before, input_embeddings_after[:-1])
-    print('pre-chunk equal for input_embeddings')
-    lm_head_after.data[-1] = lm_head_before.mean(dim=0)
-    input_embeddings_after.data[-1] = input_embeddings_before.mean(dim=0)
-
-    print('double check: ')
-    print('embedding size', gpt_model.get_input_embeddings().weight.size())
-    print('lm_head size', gpt_model.get_output_embeddings().weight.size())
     model = gpt_model
 
-    train_dataset, val_dataset, eval_dataset, data_collator = get_all_datasets(
-        config=config,
-        tokenizer=tokenizer,
-        data_args=data_args,
-        training_args=training_args,
-        model_args=model_args,
-    )
 
-    # Materialize the prompts.
-    generation_stuff = dict(
-        train_prompts=get_prompt_dataset(file_path=data_args.train_prompt_file, tokenizer=tokenizer),
-        val_prompts=get_prompt_dataset(file_path=data_args.val_prompt_file, tokenizer=tokenizer),
-        eval_prompts=get_prompt_dataset(file_path=data_args.eval_prompt_file, tokenizer=tokenizer),
-    )
+    # Load data
+    dataset = datasets.load_dataset('json', data_files=data_args.data_folder)
 
+
+    # Tokenize data
+    with training_args.main_process_first(desc="tokenizing dataset"):
+        dataset = dataset.map(
+            lambda batch: tokenizer(batch['text'], padding="max_length", truncation=True, max_length=data_args.max_seq_len),
+            batched=True, num_proc=8, desc="tokenizing dataset", remove_columns=dataset.column_names['train']
+        )
+
+
+
+    data_collator = transformers.DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False, pad_to_multiple_of=16)
+    # train_dataset, val_dataset, eval_dataset, data_collator = get_all_datasets(
+    #     config=config,
+    #     tokenizer=tokenizer,
+    #     data_args=data_args,
+    #     training_args=training_args,
+    #     model_args=model_args,
+    # )
+    # data_collator = DataCollatorForData2TextLanguageModeling(
+    #             tokenizer=tokenizer, mlm=False, format_mode=data_args.format_mode
+    #         )
+    # # Materialize the prompts.
+    # generation_stuff = dict(
+    #     train_prompts=get_prompt_dataset(file_path=data_args.train_prompt_file, tokenizer=tokenizer),
+    #     val_prompts=get_prompt_dataset(file_path=data_args.val_prompt_file, tokenizer=tokenizer),
+    #     eval_prompts=get_prompt_dataset(file_path=data_args.eval_prompt_file, tokenizer=tokenizer),
+    # )
     trainer = Trainer(
         model=model,
         tokenizer=tokenizer,
@@ -207,33 +181,13 @@ def main():
         model_args=model_args,
         data_args=data_args,
         privacy_args=privacy_args,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        eval_dataset=eval_dataset,
+        train_dataset=dataset['train'],
+        val_dataset=dataset['train'].select(range(80)),
+        eval_dataset=dataset['train'].select(range(80)),
         data_collator=data_collator,
-        generation_stuff=generation_stuff,
+        generation_stuff=None,
     )
 
-    # Massage the parameters.
-    if model_args.attention_only:
-        model.requires_grad_(False)
-        for name, param in model.named_parameters():
-            if 'c_attn.weight' in name:
-                param.requires_grad_(True)
-    elif model_args.bias_only:
-        for name, param in model.named_parameters():
-            if '.bias' not in name:
-                param.requires_grad_(False)        
-        if model_args.static_lm_head and hasattr(model, 'lm_head'):
-            model.lm_head.requires_grad_(False)
-    else:
-        model.requires_grad_(True)
-        if model_args.static_lm_head:
-            model.get_output_embeddings().requires_grad_(False)
-        if model_args.static_embedding:
-            model.get_input_embeddings().requires_grad_(False)
-            model.transformer.wpe.requires_grad_(False)
-    print(f"bias_only: {model_args.bias_only} | attention_only: {model_args.attention_only}")
         
         
     params = tuple(param for param in model.parameters() if param.requires_grad)
@@ -261,7 +215,7 @@ def main():
         num_GPUs=1
         
     if training_args.logical_batch_size!=None:
-        trainer.args.gradient_accumulation_steps=training_args.logical_batch_size/training_args.per_device_train_batch_size/num_GPUs
+        trainer.args.gradient_accumulation_steps=int(training_args.logical_batch_size/training_args.per_device_train_batch_size/num_GPUs)
     else:
         training_args.logical_batch_size=trainer.args.gradient_accumulation_steps*training_args.per_device_train_batch_size*num_GPUs
 
@@ -276,8 +230,9 @@ def main():
         )
     else:
         trainer.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(trainer.optimizer, lambda _: 1.)
-
+    print(len(dataset['train']))
     # Hacky way to set noise_multiplier.
+    privacy_args.target_delta = 1/(len(dataset['train']) * math.log(len(dataset['train']))) # 1/n*log(n)
     if privacy_args.non_private:
         privacy_args.noise_multiplier = 0.
         privacy_args.per_example_max_grad_norm = None
@@ -287,7 +242,7 @@ def main():
         privacy_engine = PrivacyEngine(
             module=model,
             batch_size=training_args.logical_batch_size,
-            sample_size=len(train_dataset),
+            sample_size=len(dataset['train']),
             epochs=training_args.num_train_epochs,
             max_grad_norm=privacy_args.per_example_max_grad_norm,
             noise_multiplier=privacy_args.noise_multiplier,
@@ -304,7 +259,7 @@ def main():
 
         # Originally, these could have been null.
         privacy_args.noise_multiplier = privacy_engine.noise_multiplier
-        privacy_args.target_delta = privacy_engine.target_delta
+        
 
         print('privacy_args: ')
         print(json.dumps(privacy_args.__dict__, indent=4))
@@ -333,26 +288,27 @@ def main():
 
         logger.info("*** Train ***")
         logger.info(
-            f"Training set size: {len(train_dataset)}, "
+            f"Training set size: {len(dataset['train'])}, "
             f"per_device_train_batch_size: {training_args.per_device_train_batch_size}, "
             f"gradient_accumulation_steps: {training_args.gradient_accumulation_steps}"
         )
         trainer.train(model_path=None)
-        if training_args.save_at_last:
-            trainer.save_model()
-
+        # if training_args.save_at_last:
+        #     trainer.save_model()
+    model.save_pretrained(training_args.output_dir)
+    tokenizer.save_pretrained(training_args.output_dir)
     # Evaluation
-    if training_args.do_eval:
-        logger.info("*** Evaluate ***")
+    # if training_args.do_eval:
+    #     logger.info("*** Evaluate ***")
 
-        output = trainer.evaluate(log_results=False)
-        utils.jdump(
-            output,
-            os.path.join(training_args.output_dir, "final_results.json"),
-        )
+    #     output = trainer.evaluate(log_results=False)
+    #     utils.jdump(
+    #         output,
+    #         os.path.join(training_args.output_dir, "final_results.json"),
+    #     )
 
-        logger.info("***** Eval results *****")
-        logger.info(output)
+    #     logger.info("***** Eval results *****")
+    #     logger.info(output)
 
 
 if __name__ == "__main__":
