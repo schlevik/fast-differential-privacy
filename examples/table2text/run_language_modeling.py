@@ -31,7 +31,7 @@ from ml_swissknife import utils
 from transformers import HfArgumentParser, MODEL_WITH_LM_HEAD_MAPPING, set_seed
 from transformers.models.gpt2 import GPT2Tokenizer
 from transformers.optimization import get_linear_schedule_with_warmup
-
+from torch.utils.data import DataLoader
 from fastDP import PrivacyEngine
 from compiled_args import (DataTrainingArguments, ModelArguments, PrivacyArguments,
                             TrainingArguments)
@@ -135,11 +135,22 @@ def main():
         config = gpt_model.config
     else:
         gpt_model  = transformers.AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path)
-        config = gpt_model.config
         tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path)
-        if not tokenizer.pad_token:
-            tokenizer.pad_token = tokenizer.eos_token
-            tokenizer.pad_token_id = tokenizer.eos_token_id
+        # if pad token is not present add [PAD] to tokenizer
+        print(f'before len(tokenizer) = {len(tokenizer)}')
+        num_new_tokens = tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+        print(f'after len(tokenizer) = {len(tokenizer)}')
+        gpt_model.resize_token_embeddings(len(tokenizer))
+
+        input_embeddings = gpt_model.get_input_embeddings().weight.data
+        output_embeddings = gpt_model.get_output_embeddings().weight.data
+        input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+        output_embeddings_avg = output_embeddings[-num_new_tokens:].mean(dim=0, keepdim=True)
+
+        input_embeddings[-num_new_tokens:] = input_embeddings_avg
+        output_embeddings[-num_new_tokens:] = output_embeddings_avg
+
+        
 
     model = gpt_model
 
@@ -147,33 +158,49 @@ def main():
     # Load data
     dataset = datasets.load_dataset('json', data_files=data_args.data_folder)
 
+    def preprocess_function(examples):
+        batch = []
+        for t in range(len(examples['text'])):
+            text = examples['text'][t] + tokenizer.eos_token
+            batch.append(text)
 
-    # Tokenize data
+        result = tokenizer(batch, padding="longest", truncation=True,
+                           max_length=data_args.max_seq_len)
+
+        return result
+    
+    
+
+    # # Tokenize data
+    # with training_args.main_process_first(desc="tokenizing dataset"):
+    #     dataset = dataset.map(
+    #         lambda batch: tokenizer(batch['text'], padding="max_length", truncation=True, max_length=data_args.max_seq_len),
+    #         batched=True, num_proc=8, desc="tokenizing dataset", remove_columns=dataset.column_names['train']
+    #     )
+
+    # print(dataset['train'][0])
+    train_data = dataset['train']
     with training_args.main_process_first(desc="tokenizing dataset"):
-        dataset = dataset.map(
-            lambda batch: tokenizer(batch['text'], padding="max_length", truncation=True, max_length=data_args.max_seq_len),
-            batched=True, num_proc=8, desc="tokenizing dataset", remove_columns=dataset.column_names['train']
-        )
-
-
+        train_data = train_data.map(
+            preprocess_function, batched=True, desc="tokenizing dataset", remove_columns=dataset.column_names['train']
+        ).train_test_split(test_size=0.1)
 
     data_collator = transformers.DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False, pad_to_multiple_of=16)
-    # train_dataset, val_dataset, eval_dataset, data_collator = get_all_datasets(
-    #     config=config,
-    #     tokenizer=tokenizer,
-    #     data_args=data_args,
-    #     training_args=training_args,
-    #     model_args=model_args,
-    # )
-    # data_collator = DataCollatorForData2TextLanguageModeling(
-    #             tokenizer=tokenizer, mlm=False, format_mode=data_args.format_mode
-    #         )
-    # # Materialize the prompts.
-    # generation_stuff = dict(
-    #     train_prompts=get_prompt_dataset(file_path=data_args.train_prompt_file, tokenizer=tokenizer),
-    #     val_prompts=get_prompt_dataset(file_path=data_args.val_prompt_file, tokenizer=tokenizer),
-    #     eval_prompts=get_prompt_dataset(file_path=data_args.eval_prompt_file, tokenizer=tokenizer),
-    # )
+    
+    train_dataloader = DataLoader(train_data['train'], batch_size=6, shuffle=True, collate_fn=data_collator)
+    for batch in train_dataloader:
+        print("*"*100)
+        print("sample input")
+        print(tokenizer.decode(batch['input_ids'][0]))
+        res = []
+        for i in range(len(batch['labels'][0])):
+            if batch['labels'][0][i] != -100:
+                res.append(batch['labels'][0][i])
+        print("sample output")
+        print(tokenizer.decode(res))
+        print("*"*100)
+        break
+
     trainer = Trainer(
         model=model,
         tokenizer=tokenizer,
@@ -181,9 +208,9 @@ def main():
         model_args=model_args,
         data_args=data_args,
         privacy_args=privacy_args,
-        train_dataset=dataset['train'],
-        val_dataset=dataset['train'].select(range(80)),
-        eval_dataset=dataset['train'].select(range(80)),
+        train_dataset=train_data['train'],
+        val_dataset=train_data['test'],
+        eval_dataset=train_data['test'],
         data_collator=data_collator,
         generation_stuff=None,
     )
@@ -196,7 +223,8 @@ def main():
     print(f"Number of trainable params: {num_trainable_params / 1e6:.4f} million")
     print(f'Number of total params: {sum(param.numel() for param in model.parameters()) / 1e6:.3f} million')
 
-    print(json.dumps(names, indent=4))
+    
+
 
     # TODO: Using a single gigantic parameter group is okay only when `weight_decay` is 0.
     #   Biases and LM parameters should not be decayed perhaps even with privacy.
@@ -297,18 +325,7 @@ def main():
         #     trainer.save_model()
     model.save_pretrained(training_args.output_dir)
     tokenizer.save_pretrained(training_args.output_dir)
-    # Evaluation
-    # if training_args.do_eval:
-    #     logger.info("*** Evaluate ***")
-
-    #     output = trainer.evaluate(log_results=False)
-    #     utils.jdump(
-    #         output,
-    #         os.path.join(training_args.output_dir, "final_results.json"),
-    #     )
-
-    #     logger.info("***** Eval results *****")
-    #     logger.info(output)
+  
 
 
 if __name__ == "__main__":
